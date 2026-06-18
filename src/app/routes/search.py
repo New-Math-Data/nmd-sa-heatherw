@@ -1,82 +1,93 @@
-"""Search and extraction API routes.
-
-TODO: Wire up the BedrockService to implement these endpoints.
-The service class (src/services/bedrock.py) is fully implemented — you just need to:
-1. Import and instantiate BedrockService
-2. Use generate_embedding() for search
-3. Use extract_fields() for extraction
-4. Query pgvector using cosine distance (<=> operator)
-"""
+"""Search and extraction API routes."""
 
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import JSONResponse
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db
+from common.settings import get_settings
 from models.schemas import (
     FieldExtractionRequest,
     FieldExtractionResponse,
     SearchRequest,
     SearchResult,
 )
+from services.bedrock import BedrockService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["search"])
 
 
+def _get_bedrock_service() -> BedrockService:
+    """Create a BedrockService instance from app settings."""
+    settings = get_settings()
+    return BedrockService(
+        region=settings.aws_region or "us-west-2",
+        profile=settings.aws_profile,
+    )
+
+
 @router.post("/search", response_model=list[SearchResult])
 async def search_documents(
     request: SearchRequest,
     db: AsyncSession = Depends(get_db),
-) -> JSONResponse:
-    """Search documents using vector similarity.
+) -> list[SearchResult]:
+    """Search documents using vector similarity."""
+    logger.info("Search requested: %s", request.query)
 
-    TODO: Implement this endpoint by:
-    1. Instantiating BedrockService (from services.bedrock)
-    2. Calling generate_embedding(request.query) to get the query vector
-    3. Using pgvector's cosine distance operator (<=>) to find similar documents
-    4. Returning results as a list of SearchResult
+    bedrock = _get_bedrock_service()
+    embedding = await bedrock.generate_embedding(request.query)
 
-    Hint — pgvector cosine distance query:
-        SELECT *, embedding <=> '<vector>'::vector AS distance
+    # pgvector cosine distance query
+    # Use CAST() instead of :: to avoid conflict with SQLAlchemy's :param syntax
+    embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+    query = text("""
+        SELECT id, title, content, metadata,
+               1 - (embedding <=> CAST(:embedding AS vector)) AS score
         FROM documents
         WHERE embedding IS NOT NULL
-        ORDER BY distance
+        ORDER BY embedding <=> CAST(:embedding AS vector)
         LIMIT :top_k
-    """
-    logger.info("Search requested: %s", request.query)
-    return JSONResponse(
-        status_code=501,
-        content={
-            "detail": "Search endpoint not wired up. "
-            "BedrockService is implemented — connect it to this route. "
-            "See the TODO in this file and src/services/bedrock.py."
-        },
-    )
+    """)
+
+    result = await db.execute(query, {"embedding": embedding_str, "top_k": request.top_k})
+    rows = result.fetchall()
+
+    return [
+        SearchResult(
+            id=row.id,
+            title=row.title,
+            content=row.content,
+            score=row.score,
+            metadata_=row.metadata,
+        )
+        for row in rows
+    ]
 
 
 @router.post("/extract", response_model=FieldExtractionResponse)
 async def extract_fields(
     request: FieldExtractionRequest,
     db: AsyncSession = Depends(get_db),
-) -> JSONResponse:
-    """Extract structured fields from a document using an LLM.
-
-    TODO: Implement this endpoint by:
-    1. Loading the document from the database by request.document_id
-    2. Instantiating BedrockService (from services.bedrock)
-    3. Calling extract_fields(document.content, request.fields)
-    4. Returning a FieldExtractionResponse
-    """
+) -> FieldExtractionResponse:
+    """Extract structured fields from a document using an LLM."""
     logger.info("Field extraction requested for document: %s", request.document_id)
-    return JSONResponse(
-        status_code=501,
-        content={
-            "detail": "Extract endpoint not wired up. "
-            "BedrockService is implemented — connect it to this route. "
-            "See the TODO in this file and src/services/bedrock.py."
-        },
+
+    # Load document from DB
+    query = text("SELECT id, content FROM documents WHERE id = :doc_id")
+    result = await db.execute(query, {"doc_id": str(request.document_id)})
+    row = result.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    bedrock = _get_bedrock_service()
+    extracted = await bedrock.extract_fields(row.content, request.fields)
+
+    return FieldExtractionResponse(
+        document_id=request.document_id,
+        extracted_fields=extracted,
     )
