@@ -57,3 +57,8 @@ variable "database_url" {
   type        = string
   sensitive   = true
 }
+
+variable "alb_security_group_id" {
+  description = "Security group ID of the ALB (for ingress rules)"
+  type        = string
+}

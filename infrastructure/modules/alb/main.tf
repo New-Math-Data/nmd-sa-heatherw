@@ -38,6 +38,17 @@ resource "aws_lb_target_group" "main" {
   vpc_id      = var.vpc_id
   target_type = "ip"
 
+  health_check {
+    path                = "/health"
+    port                = "traffic-port"
+    protocol            = "HTTP"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    timeout             = 5
+    interval            = 30
+    matcher             = "200"
+  }
+
   tags = var.tags
 }
 
